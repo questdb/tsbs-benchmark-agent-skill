@@ -1,0 +1,3 @@
+interface:
+  display_name: "QuestDB TSBS Benchmark"
+  short_description: "Run end-to-end TSBS benchmarks on QuestDB in Docker"
