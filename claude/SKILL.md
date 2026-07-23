@@ -8,30 +8,63 @@ description: Run full TSBS (Time Series Benchmark Suite) benchmarks against Ques
 Run the full TSBS (Time Series Benchmark Suite) against QuestDB running in Docker.
 This skill handles all prerequisites, data generation, loading, and query benchmarking.
 
-QuestDB accepts data over two ingestion protocols, and TSBS benchmarks both:
+QuestDB accepts data over three ingestion transports, and TSBS benchmarks all
+of them:
 
-| | **QWP** | **ILP** |
-|---|---|---|
-| Shape | binary, columnar | line protocol text |
-| Transport | WebSocket, port 9000 | TCP, port 9009 |
-| Generator format | `questdb-qwp` | `questdb` |
-| Loader flag | `--protocol=qwp` (default) | `--protocol=ilp` |
-| Delivery | acknowledged by the server | fire and forget |
+| | **QWP** | **ILP over HTTP** | **ILP over TCP** |
+|---|---|---|---|
+| Shape | binary, columnar | line protocol text | line protocol text |
+| Transport | WebSocket, port 9000 | HTTP, port 9000 | TCP, port 9009 |
+| Generator format | `questdb-qwp` | `questdb` | `questdb` |
+| Loader flag | `--protocol=qwp` (default) | `--protocol=ilp-http` | `--protocol=ilp` |
+| Delivery | acknowledged by the server | server processed the batch | fire and forget |
 
 Use QWP unless there is a reason not to: it is the faster path, and its
 reported row count is what the server confirmed rather than what was written
-to a socket. Keep ILP for a baseline comparable with other TSBS targets.
+to a socket.
+
+**An ILP/TCP number depends on the server's thread pools, so record them.**
+Measured on a 32 vCPU r8a.8xlarge, 69.1M rows, 32 workers, send rates:
+
+| server | ILP/TCP | ILP/HTTP |
+|---|---|---|
+| QuestDB 9.4.3 release, defaults | 9.3-12.5M rows/s | 6.8-6.9M rows/s |
+| 9.4.4-SNAPSHOT nightly, defaults | 1.7M rows/s | 6.9-7.0M rows/s |
+| the same nightly, `QDB_LINE_TCP_IO_WORKER_COUNT=16` | 8.0M rows/s | - |
+
+ILP/TCP varies sevenfold across builds and settings while ILP/HTTP does not
+move. The nightly gives the ILP/TCP pools 2 threads where the shared pools each
+get 31; the release build has no separate ILP pool and serves TCP from the
+shared ones. Before reporting an ILP/TCP figure, check the pool sizes:
+
+```bash
+QPID=$(pgrep -f questdb | head -1)
+ps -L -o comm= -p "$QPID" | sed 's/_[0-9]*$//' | sort | uniq -c | sort -rn | head -8
+```
+
+If `ilpio` is far smaller than `shared-network`, say so with the number, or use
+`ilp-http`, which the shared pools serve and which measured 6.8-7.0M rows/s on
+both builds with no tuning.
+
+Also note that ILP/TCP's send rate flatters it most, being fire-and-forget: on
+the release build it sent 9.3-12.5M rows/s but committed only 3.2-3.9M, where
+HTTP sent 6.8-6.9M and committed 5.0-5.1M.
 
 ## Step 0: Choose the protocols
 
-Ask the operator which ingestion protocol to benchmark: `qwp`, `ilp`, or `both`.
-If running unattended, default to `qwp`. Everything below branches on this
-choice, so settle it before generating any data - the two protocols need
-different data files, and at scale 4000 that is 12 GB versus 3.6 GB on disk.
+Ask the operator which ingestion protocol to benchmark: `qwp`, `ilp-http`,
+`ilp`, or `all`. If running unattended, default to `qwp`. Everything below
+branches on this choice, so settle it before generating any data - QWP wants
+the binary format and the ILP transports want text, and at scale 4000 those are
+3.6 GB and 12 GB on disk respectively.
 
 ```bash
-PROTOCOL=qwp    # qwp | ilp | both
+PROTOCOL=qwp    # qwp | ilp-http | ilp | all
 ```
+
+For a protocol comparison, `all` is the useful setting: it loads the same rows
+over each transport in turn and reports them side by side. Both ILP transports
+read the same text file, so `all` needs only the two data files.
 
 Queries have their own transport, independent of the ingestion one, chosen in
 Step 7. Data written over either protocol can be queried over any of them.
@@ -128,11 +161,19 @@ $TSBS_BIN/tsbs_generate_data --use-case=cpu-only --seed=123 --scale=1 \
 
 $TSBS_BIN/tsbs_load_questdb --file=/tmp/qwp-smoke.qwp --workers=1
 
-curl -s -G --data-urlencode "query=select count from cpu" http://127.0.0.1:9000/exec
+# WAL apply is asynchronous, so poll rather than reading the count once
+for i in $(seq 1 30); do
+  N=$(curl -s -G --data-urlencode "query=select count from cpu" http://127.0.0.1:9000/exec | grep -o '\[\[[0-9]*' | tr -d '[')
+  if [ "$N" = "10" ]; then break; fi
+  sleep 1
+done
+echo "smoke rows: $N"
 curl -s -G --data-urlencode "query=drop table if exists cpu" http://127.0.0.1:9000/exec
 rm -f /tmp/qwp-smoke.qwp
 ```
-A count of 10 means QWP works. A `PARSE_ERROR` such as `invalid column type
+A count of 10 means QWP works. A count of `0` read immediately after the load
+is not a failure, it means the count was taken before the WAL was applied,
+which is why the loop polls. A `PARSE_ERROR` such as `invalid column type
 code` means the image is too old for the client's QWP version: stop and report
 that rather than falling back silently, since an ILP number reported as a QWP
 number is worse than no number.
@@ -185,7 +226,14 @@ needed, and `qwp` is the default protocol:
   --file=/tmp/questdb-data.qwp \
   --workers=$WORKERS
 ```
-ILP:
+ILP over HTTP:
+```bash
+/home/ubuntu/tsbs/bin/tsbs_load_questdb \
+  --file=/tmp/questdb-data.txt \
+  --protocol=ilp-http \
+  --workers=$WORKERS
+```
+ILP over TCP:
 ```bash
 /home/ubuntu/tsbs/bin/tsbs_load_questdb \
   --file=/tmp/questdb-data.txt \
@@ -195,13 +243,22 @@ ILP:
 Report the `overall row/s` and `overall metric/s` figures from the summary.
 
 Then confirm what the server actually committed, which is the number worth
-quoting:
+quoting. QuestDB applies the write-ahead log asynchronously, so a count taken
+the instant a load finishes will read low, and an `ilp` run returns as soon as
+the bytes are written. Poll until the count reaches the expected total or stops
+rising:
 ```bash
-curl -s -G --data-urlencode "query=select count from cpu" http://127.0.0.1:9000/exec
+EXPECTED=34560000
+for i in $(seq 1 600); do
+  N=$(curl -s -G --data-urlencode "query=select count from cpu" http://127.0.0.1:9000/exec | grep -o '\[\[[0-9]*' | tr -d '[')
+  echo "committed: $N"
+  if [ "$N" -ge "$EXPECTED" ]; then break; fi
+  sleep 1
+done
 ```
-It should read 34560000. Poll it until it stops rising: an ILP run in
-particular returns as soon as the bytes are written, so the server can still be
-applying rows after the loader has exited.
+Time from the start of the load to the moment that count is reached: that is
+the committed-rows throughput, and it is the only figure comparable across all
+three transports.
 
 When benchmarking `both`, drop the table between the two loads so each starts
 from empty, and load ILP first so the QWP run is not the one paying for a cold

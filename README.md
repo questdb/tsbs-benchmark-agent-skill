@@ -10,7 +10,7 @@ Ingestion can be benchmarked over either of QuestDB's two protocols: **QWP**, th
 
 The skill walks the agent through the full TSBS pipeline:
 
-1. **Choose the protocol** - Asks whether to benchmark `qwp`, `ilp`, or `both`, defaulting to `qwp` when unattended
+1. **Choose the protocol** - Asks whether to benchmark `qwp`, `ilp-http`, `ilp`, or `all`, defaulting to `qwp` when unattended
 2. **Prerequisites** - Checks for and installs Docker, Go 1.23+ (current stable, right architecture for x86 or Graviton), and build tools
 3. **Start QuestDB** - Pulls and runs `questdb/questdb:nightly` in Docker
 4. **Build TSBS** - Clones [questdb/tsbs](https://github.com/questdb/tsbs) and compiles the four required binaries
@@ -23,16 +23,20 @@ The skill walks the agent through the full TSBS pipeline:
 
 ## Ingestion protocols
 
-| | QWP | ILP |
-|---|---|---|
-| Shape | binary, columnar | line protocol text |
-| Transport | WebSocket, port 9000 | TCP, port 9009 |
-| Generator format | `questdb-qwp` | `questdb` |
-| Loader flag | `--protocol=qwp` (default) | `--protocol=ilp` |
-| Delivery | acknowledged by the server | fire and forget |
-| Data size at scale 4000 | ~3.6 GB | ~12 GB |
+| | QWP | ILP over HTTP | ILP over TCP |
+|---|---|---|---|
+| Shape | binary, columnar | line protocol text | line protocol text |
+| Transport | WebSocket, port 9000 | HTTP, port 9000 | TCP, port 9009 |
+| Generator format | `questdb-qwp` | `questdb` | `questdb` |
+| Loader flag | `--protocol=qwp` (default) | `--protocol=ilp-http` | `--protocol=ilp` |
+| Delivery | acknowledged by the server | server processed the batch | fire and forget |
+| Data size at scale 4000 | ~3.6 GB | ~12 GB | ~12 GB |
 
-QWP is the faster path and the one to use unless an ILP baseline is wanted for comparison with other TSBS targets. It also reports honestly: a QWP run's row count is what the server confirmed, whereas the ILP loader's summary counts bytes written to a socket, which overstates the rate.
+QWP is the faster path and the one to use unless a line protocol baseline is wanted. For that baseline use **`ilp-http`**, the transport QuestDB recommends for line protocol today.
+
+**An `ilp` (TCP) number depends on the server's thread pools.** On a 32 vCPU r8a.8xlarge with 69.1M rows and 32 workers, ILP/TCP sent 9.2M rows/s on the 9.4.3 release with defaults, 1.7M on the 9.4.4-SNAPSHOT nightly with defaults, and 8.0M on that same nightly with `QDB_LINE_TCP_IO_WORKER_COUNT=16`. The nightly gives the ILP/TCP pools 2 threads where the shared pools each get 31. The skill checks the pool sizes and records them with the result; `ilp-http` rides the shared pools and needed no tuning on either build.
+
+Reporting honestly matters too: a QWP run's row count is what the server confirmed, whereas the `ilp` loader summary counts bytes written to a socket. The skill polls the server for the committed row count after every load, which is the only figure comparable across transports. That gap is real: QWP sends at 11.5M rows/s without per-batch acks and 14.3M with them, yet commits 6.7M and 6.3M respectively - the send rate moves 25% depending purely on when the client waits.
 
 The QWP data format matters as much as the protocol. `questdb-qwp` writes the same points in a binary schema-and-dictionary encoding, so the loader sends them without parsing text. Loading text over QWP works but measures the client's parser as much as the database.
 
