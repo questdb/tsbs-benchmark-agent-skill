@@ -19,9 +19,35 @@ of them:
 | Loader flag | `--protocol=qwp` (default) | `--protocol=ilp-http` | `--protocol=ilp` |
 | Delivery | acknowledged by the server | server processed the batch | fire and forget |
 
-Use QWP unless there is a reason not to: it is the faster path, and its
-reported row count is what the server confirmed rather than what was written
-to a socket.
+QWP's reported row count is what the server confirmed, not just what was written
+to a socket. But whether it is "faster" than ILP depends entirely on topology,
+and this skill runs the loader and the server on the same box, which is the case
+that understates QWP the most (see next).
+
+### Co-located ingestion understates QWP
+
+This skill benchmarks with the loader and QuestDB on one instance, matching the
+published comparison posts. On that setup QWP and a well-configured ILP/TCP come
+out roughly level on rows sent, and it is a measurement artefact, not a property
+of the protocols.
+
+QWP is a binary columnar protocol: the client encodes every row into the wire
+format before sending. ILP just writes text, which is already the wire format,
+so its client does almost no work. When client and server share the CPU, QWP's
+encoding competes with the server for cores and the two roughly cancel. Measured
+on a 32 vCPU box, the QWP loader used ~10 cores, the ILP loader ~1.7.
+
+Put the client on its own instance and the picture separates: over a real
+network both ILP transports saturate the link at ~5.3M rows/s while QWP sustains
+9-12M, because line protocol text is ~3.4x larger on the wire. QWP is **faster
+over a network, level on a shared box.**
+
+So report a co-located QWP number as exactly that, and do not present it as
+QWP's ceiling. `--qwp-preencode-replay` is a diagnostic that removes the client
+encoding from the timed interval (it pre-builds the frames, then replays them);
+on the same hardware it took QWP from ~9M to ~18M over a network and ~48M on
+localhost, which is the server's true ingest capacity. Use it to show what the
+server can take when the Go client is not the bottleneck.
 
 **An ILP/TCP number depends on the server's thread pools, so record them.**
 Measured on a 32 vCPU r8a.8xlarge, 69.1M rows, 32 workers, send rates:

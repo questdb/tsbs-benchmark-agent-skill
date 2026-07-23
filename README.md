@@ -32,7 +32,7 @@ The skill walks the agent through the full TSBS pipeline:
 | Delivery | acknowledged by the server | server processed the batch | fire and forget |
 | Data size at scale 4000 | ~3.6 GB | ~12 GB | ~12 GB |
 
-QWP is the faster path and the one to use unless a line protocol baseline is wanted. For that baseline use **`ilp-http`**, the transport QuestDB recommends for line protocol today.
+Use **`ilp-http`** for a line protocol baseline, the transport QuestDB recommends today. Whether QWP is "faster" than ILP depends on topology, and the skill runs the loader and server on one box, which understates QWP: QWP is a binary protocol whose client encodes every row, so on a shared machine its encoding competes with the server for CPU (the QWP loader used ~10 of 32 cores, the ILP loader ~1.7), and the two come out roughly level on rows sent. Split the client onto its own instance and QWP pulls ahead 1.7-2.2x, because line protocol text is ~3.4x larger on the wire and ILP saturates the network first. QWP is **faster over a network, level on a shared box** - report a co-located number as exactly that.
 
 **An `ilp` (TCP) number depends on the server's thread pools.** On a 32 vCPU r8a.8xlarge with 69.1M rows and 32 workers, ILP/TCP sent 9.2M rows/s on the 9.4.3 release with defaults, 1.7M on the 9.4.4-SNAPSHOT nightly with defaults, and 8.0M on that same nightly with `QDB_LINE_TCP_IO_WORKER_COUNT=16`. The nightly gives the ILP/TCP pools 2 threads where the shared pools each get 31. The skill checks the pool sizes and records them with the result; `ilp-http` rides the shared pools and needed no tuning on either build.
 
