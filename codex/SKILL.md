@@ -48,6 +48,33 @@ encoding from the timed interval (it pre-builds the frames, then replays them);
 on the same hardware it took QWP from ~9M to ~18M over a network and ~48M on
 localhost, which is the server's true ingest capacity.
 
+### Pin the CPUs when co-located, and keep the server's budget fixed
+
+When the loader and QuestDB share a box they fight for the same cores, and that
+fight is not symmetric: the QWP client encodes every row while the ILP client
+does almost none, so the result flatters whichever protocol leaves more cores
+for the server. Pin them to disjoint core sets so both protocols see the same,
+non-competing budget:
+
+- Start QuestDB on half the cores and size its pools to match:
+  `docker run --cpuset-cpus=0-15 -e QDB_SHARED_WORKER_COUNT=15 -e QDB_LINE_TCP_IO_WORKER_COUNT=15 -e QDB_LINE_TCP_WRITER_WORKER_COUNT=15 ...`
+- Run the loader on the other half: `taskset -c 16-31 tsbs_load_questdb ...`.
+
+Keep the server's core count identical whether the client is co-located or on
+its own box. If the co-located server gets 16 cores but the networked server
+gets all 32, the network run is not measuring the network, it is measuring a
+bigger server, and the two topologies stop being comparable.
+
+### Sending tags as VARCHAR at very high cardinality
+
+`--qwp-tags-as-varchar` sends tag columns as VARCHAR strings instead of QWP
+SYMBOLs, so no per-frame symbol dictionary is shipped. The server still stores
+the columns as SYMBOL as long as the table already exists with SYMBOL columns
+(pre-create it, or let an earlier SYMBOL load create it). At low cardinality
+this makes each row larger on the wire; at very high cardinality it avoids the
+per-frame dictionary growth that otherwise inflates QWP frames. The table
+definition is unchanged, so queries and storage are unaffected.
+
 **An ILP/TCP number depends on the server's thread pools, so record them.**
 Measured on a 32 vCPU r8a.8xlarge, 69.1M rows, 32 workers, send rates:
 
