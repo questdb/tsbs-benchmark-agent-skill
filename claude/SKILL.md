@@ -54,17 +54,19 @@ server can take when the Go client is not the bottleneck.
 When the loader and QuestDB share a box they fight for the same cores, and that
 fight is not symmetric: the QWP client encodes every row while the ILP client
 does almost none, so the result flatters whichever protocol leaves more cores
-for the server. Pin them to disjoint core sets so both protocols see the same,
-non-competing budget:
+for the server. The loaders are light (ILP used ~1.7 cores, a replay send is
+lighter), so give the client a couple of cores and the server the rest, on
+disjoint sets so both protocols see the same, non-competing budget:
 
-- Start QuestDB on half the cores and size its pools to match:
-  `docker run --cpuset-cpus=0-15 -e QDB_SHARED_WORKER_COUNT=15 -e QDB_LINE_TCP_IO_WORKER_COUNT=15 -e QDB_LINE_TCP_WRITER_WORKER_COUNT=15 ...`
-- Run the loader on the other half: `taskset -c 16-31 tsbs_load_questdb ...`.
+- Start QuestDB on almost all the cores and size its pools to match:
+  `docker run --cpuset-cpus=0-29 -e QDB_SHARED_WORKER_COUNT=29 -e QDB_LINE_TCP_IO_WORKER_COUNT=29 -e QDB_LINE_TCP_WRITER_WORKER_COUNT=29 ...`
+- Run the loader on the remaining cores: `taskset -c 30-31 tsbs_load_questdb ...`.
 
 Keep the server's core count identical whether the client is co-located or on
-its own box. If the co-located server gets 16 cores but the networked server
-gets all 32, the network run is not measuring the network, it is measuring a
-bigger server, and the two topologies stop being comparable.
+its own box: give it the same 30 cores over the network too. If the co-located
+server gets 30 cores but the networked server gets all 32, the network run is
+measuring a bigger server, not the network, and the two topologies stop being
+comparable.
 
 ### Sending tags as VARCHAR at very high cardinality
 
