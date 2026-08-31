@@ -7,12 +7,20 @@ description: Use when asked to run, compare, or troubleshoot QuestDB TSBS ingest
 
 Run the TSBS `cpu-only` workload against QuestDB in Docker. Keep workload inputs and benchmark policy explicit, collect each measured sample separately, and summarize the samples only after the run.
 
+Assemble the snippets below into one `benchmark.sh` and execute them in one Bash process; later sections use variables and functions from earlier ones. Start the script with strict failure handling so a failed TSBS command cannot be hidden by `tee`:
+
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+```
+
 ## Benchmark choices
 
 Use these practical defaults unless the operator requests different values:
 
 ```bash
 QUESTDB_IMAGE="${QUESTDB_IMAGE:-questdb/questdb:latest}"
+CONTAINER_NAME="${CONTAINER_NAME:-questdb-tsbs-benchmark}"
 INGEST_PROTOCOL="${INGEST_PROTOCOL:-ilp}"       # ilp | ilp-http | qwip
 QUERY_PROTOCOL="${QUERY_PROTOCOL:-pgwire}"     # pgwire | http | qwep
 QUERY_CACHE="${QUERY_CACHE:-warm}"             # warm | cold
@@ -21,6 +29,8 @@ WARMUP_RUNS="${WARMUP_RUNS:-3}"
 HOSTS="${HOSTS:-4000}"
 QUERIES_PER_TYPE="${QUERIES_PER_TYPE:-1000}"
 LOAD_WORKERS="${LOAD_WORKERS:-$(nproc)}"
+METRICS_PER_ROW="${METRICS_PER_ROW:-10}"
+PAGE_CACHE_RESET_COMMAND="${PAGE_CACHE_RESET_COMMAND:-}"
 if [ "$LOAD_WORKERS" -gt 32 ]; then LOAD_WORKERS=32; fi
 ```
 
@@ -39,7 +49,7 @@ Choose protocols before generating data. `qwip` uses the `questdb-qwp` data form
 
 ## 1. Check prerequisites
 
-Require Linux, Docker, Git, Make, a C compiler, `curl`, and a Go version compatible with the current `questdb/tsbs` `go.mod`.
+Require Linux, Docker, Git, Make, a C compiler, `curl`, `jq`, GNU core utilities (`date`, `nproc`, and `seq`), and a Go version compatible with the current `questdb/tsbs` `go.mod`.
 
 ```bash
 docker --version
@@ -57,7 +67,8 @@ Use a dedicated workspace and the current QuestDB TSBS fork:
 ```bash
 WORKDIR="${WORKDIR:-$HOME/tsbs-benchmark}"
 TSBS_DIR="$WORKDIR/tsbs"
-RESULTS_DIR="$WORKDIR/results"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$INGEST_PROTOCOL-$QUERY_PROTOCOL-$QUERY_CACHE}"
+RESULTS_DIR="$WORKDIR/results/$RUN_ID"
 mkdir -p "$WORKDIR" "$RESULTS_DIR"
 
 if [ ! -d "$TSBS_DIR/.git" ]; then
@@ -78,29 +89,56 @@ TSBS_BIN="$TSBS_DIR/bin"
 Before a large run, check that the selected protocols are supported:
 
 ```bash
-"$TSBS_BIN/tsbs_load_questdb" --help | grep -E 'protocol|qwip|ilp-http'
-"$TSBS_BIN/tsbs_run_queries_questdb" --help | grep -E 'query-protocol|qwep|pgwire'
+load_help=$("$TSBS_BIN/tsbs_load_questdb" --help 2>&1 || true)
+query_help=$("$TSBS_BIN/tsbs_run_queries_questdb" --help 2>&1 || true)
+grep -Fq "$INGEST_PROTOCOL" <<<"$load_help" || {
+  printf 'TSBS loader does not list protocol %s\n' "$INGEST_PROTOCOL" >&2
+  exit 1
+}
+grep -Fq "$QUERY_PROTOCOL" <<<"$query_help" || {
+  printf 'TSBS query runner does not list protocol %s\n' "$QUERY_PROTOCOL" >&2
+  exit 1
+}
 ```
 
 ## 3. Start a clean QuestDB
 
 ```bash
 wait_for_questdb() {
-  until curl -fsS -o /dev/null http://127.0.0.1:9000/ping; do
+  for _ in $(seq 1 60); do
+    if curl -fsS -o /dev/null http://127.0.0.1:9000/ping; then
+      return 0
+    fi
     sleep 1
   done
+  docker logs "$CONTAINER_NAME" >&2 || true
+  return 1
+}
+
+remove_benchmark_container() {
+  if ! docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    return 0
+  fi
+  owner=$(docker inspect --format '{{ index .Config.Labels "com.questdb.tsbs-benchmark.run" }}' "$CONTAINER_NAME")
+  if [ "$owner" != "$RUN_ID" ]; then
+    printf 'refusing to remove unowned container %s\n' "$CONTAINER_NAME" >&2
+    return 1
+  fi
+  docker rm -f "$CONTAINER_NAME" >/dev/null
 }
 
 start_clean_questdb() {
-  docker rm -f questdb >/dev/null 2>&1 || true
-  docker run -d --name questdb \
-    -p 9000:9000 -p 9009:9009 -p 8812:8812 -p 9003:9003 \
+  remove_benchmark_container
+  docker run -d --name "$CONTAINER_NAME" \
+    --label "com.questdb.tsbs-benchmark.run=$RUN_ID" \
+    -p 127.0.0.1:9000:9000 \
+    -p 127.0.0.1:9009:9009 \
+    -p 127.0.0.1:8812:8812 \
     "$QUESTDB_IMAGE" >/dev/null
   wait_for_questdb
 }
 
 docker pull "$QUESTDB_IMAGE"
-start_clean_questdb
 ```
 
 Optional CPU pinning is fine for a colocated benchmark. If used, apply the same client/server allocation to every measured sample.
@@ -134,7 +172,11 @@ fi
   > "$DATA_FILE"
 ```
 
-Keep generated benchmark inputs uncompressed so compression work is outside the timed commands.
+Keep generated benchmark inputs uncompressed so compression work is outside the timed commands. The default two-day, 10-second workload produces `HOSTS * 17280` rows; set `EXPECTED_ROWS` explicitly if changing the time window or interval.
+
+```bash
+EXPECTED_ROWS="${EXPECTED_ROWS:-$((HOSTS * 17280))}"
+```
 
 Generate query streams once:
 
@@ -163,20 +205,48 @@ done
 
 ## 5. Measure ingestion
 
-Each ingestion sample starts with an empty database and loads the same generated file. Capture every sample separately.
+Each ingestion sample starts with an empty database and loads the same generated file. Capture every sample separately. A sample completes only when QuestDB exposes the expected row count.
 
 ```bash
+questdb_row_count() {
+  curl -fsS -G --data-urlencode 'query=select count() from cpu' \
+    http://127.0.0.1:9000/exec | jq -er '.dataset[0][0]'
+}
+
+wait_for_rows() {
+  expected=$1
+  deadline=$((SECONDS + 600))
+  count=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    count=$(questdb_row_count 2>/dev/null || printf '0')
+    if [ "$count" -eq "$expected" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'row-count timeout: expected=%s observed=%s\n' "$expected" "$count" >&2
+  return 1
+}
+
 for run in $(seq 1 "$RUNS"); do
+  log="$RESULTS_DIR/ingestion-run-$run.log"
   start_clean_questdb
+  started_ns=$(date +%s%N)
   "$TSBS_BIN/tsbs_load_questdb" \
     --file="$DATA_FILE" \
     --workers="$LOAD_WORKERS" \
     --protocol="$INGEST_PROTOCOL" \
-    2>&1 | tee "$RESULTS_DIR/ingestion-run-$run.log"
+    2>&1 | tee "$log"
+  wait_for_rows "$EXPECTED_ROWS"
+  duration_ns=$(($(date +%s%N) - started_ns))
+  row_rate=$(awk -v rows="$EXPECTED_ROWS" -v ns="$duration_ns" \
+    'BEGIN { printf "%.3f", rows / (ns / 1000000000) }')
+  metric_rate=$(awk -v rate="$row_rate" -v metrics="$METRICS_PER_ROW" \
+    'BEGIN { printf "%.3f", rate * metrics }')
+  printf 'applied_duration_ns=%s\napplied_rows_per_second=%s\napplied_metrics_per_second=%s\n' \
+    "$duration_ns" "$row_rate" "$metric_rate" | tee -a "$log"
 done
 ```
-
-Before accepting an ingestion sample, query QuestDB until the expected generated row count is visible. Include that wait in an end-to-end database-applied throughput measurement when comparing ingestion protocols; the loader summary alone may describe client-side completion.
 
 ## 6. Prepare query latency
 
@@ -193,15 +263,28 @@ start_clean_questdb
 
 Wait for the full generated row count before running queries.
 
+```bash
+wait_for_rows "$EXPECTED_ROWS"
+```
+
 ### Warm cache policy
 
-Apply one controlled QuestDB restart and Linux page-cache reset, then perform untimed passes over every selected query type in round-robin order. Use the host's supported cache-reset mechanism. Do not mix warm-up output with measured results.
+Apply one controlled QuestDB restart and Linux page-cache reset, then perform untimed passes over every selected query type in round-robin order. Set `PAGE_CACHE_RESET_COMMAND` to a reviewed command supported by the host; there is no privileged default. Fail closed rather than labelling restart-only results as `warm` or `cold`.
 
 ```bash
-if [ "$QUERY_CACHE" = "warm" ]; then
-  docker restart questdb >/dev/null
+if [ -z "$PAGE_CACHE_RESET_COMMAND" ]; then
+  printf 'set PAGE_CACHE_RESET_COMMAND before query benchmarking\n' >&2
+  exit 1
+fi
+
+reset_query_cache_state() {
+  docker restart "$CONTAINER_NAME" >/dev/null
   wait_for_questdb
-  # Reset the Linux page cache here using the host's supported mechanism.
+  bash -c "$PAGE_CACHE_RESET_COMMAND"
+}
+
+if [ "$QUERY_CACHE" = "warm" ]; then
+  reset_query_cache_state
 
   for warmup in $(seq 1 "$WARMUP_RUNS"); do
     for query_type in "${QUERY_TYPES[@]}"; do
@@ -228,9 +311,7 @@ Use one query worker so each TSBS process issues one query at a time. Run repeti
 for run in $(seq 1 "$RUNS"); do
   for query_type in "${QUERY_TYPES[@]}"; do
     if [ "$QUERY_CACHE" = "cold" ]; then
-      docker restart questdb >/dev/null
-      wait_for_questdb
-      # Reset the Linux page cache here using the host's supported mechanism.
+      reset_query_cache_state
     fi
 
     "$TSBS_BIN/tsbs_run_queries_questdb" \
@@ -259,7 +340,7 @@ Do not include warm-up output in aggregates. Call out failed or incomplete sampl
 ## Cleanup
 
 ```bash
-docker rm -f questdb >/dev/null 2>&1 || true
+remove_benchmark_container
 ```
 
 Keep `$RESULTS_DIR` unless the operator explicitly asks to remove it.

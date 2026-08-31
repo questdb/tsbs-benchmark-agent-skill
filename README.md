@@ -66,15 +66,21 @@ codex/
 Copy the skill into your Claude Code skills directory:
 
 ```bash
-mkdir -p ~/.claude/skills/tsbs-benchmark
-cp claude/SKILL.md ~/.claude/skills/tsbs-benchmark/SKILL.md
+mkdir -p ~/.claude/skills/questdb-tsbs-benchmark
+cp claude/SKILL.md ~/.claude/skills/questdb-tsbs-benchmark/SKILL.md
 ```
 
 Then ask Claude Code to run a QuestDB TSBS benchmark. Mention any protocol, workload, cache, or sample-count preferences; otherwise the skill uses its practical defaults.
 
 ### OpenAI Codex
 
-Copy `codex/SKILL.md` into the Codex skills directory and use it with `codex/agents/openai.yaml`.
+Copy the Codex skill and its agent configuration together:
+
+```bash
+mkdir -p ~/.codex/skills/questdb-tsbs-benchmark/agents
+cp codex/SKILL.md ~/.codex/skills/questdb-tsbs-benchmark/SKILL.md
+cp codex/agents/openai.yaml ~/.codex/skills/questdb-tsbs-benchmark/agents/openai.yaml
+```
 
 ## Results
 
