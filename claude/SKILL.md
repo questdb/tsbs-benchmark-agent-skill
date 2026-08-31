@@ -32,6 +32,9 @@ LOAD_WORKERS="${LOAD_WORKERS:-$(nproc)}"
 METRICS_PER_ROW="${METRICS_PER_ROW:-10}"
 PAGE_CACHE_RESET_COMMAND="${PAGE_CACHE_RESET_COMMAND:-}"
 if [ "$LOAD_WORKERS" -gt 32 ]; then LOAD_WORKERS=32; fi
+case "$INGEST_PROTOCOL" in ilp|ilp-http|qwip) ;; *) printf 'invalid ingestion protocol\n' >&2; exit 1 ;; esac
+case "$QUERY_PROTOCOL" in pgwire|http|qwep) ;; *) printf 'invalid query protocol\n' >&2; exit 1 ;; esac
+case "$QUERY_CACHE" in warm|cold) ;; *) printf 'invalid query cache policy\n' >&2; exit 1 ;; esac
 ```
 
 Ingestion and query protocols are independent. Use the protocol names exposed by the checked-out TSBS binaries:
@@ -67,9 +70,11 @@ Use a dedicated workspace and the current QuestDB TSBS fork:
 ```bash
 WORKDIR="${WORKDIR:-$HOME/tsbs-benchmark}"
 TSBS_DIR="$WORKDIR/tsbs"
-RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$INGEST_PROTOCOL-$QUERY_PROTOCOL-$QUERY_CACHE}"
-RESULTS_DIR="$WORKDIR/results/$RUN_ID"
-mkdir -p "$WORKDIR" "$RESULTS_DIR"
+RUN_PREFIX="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$INGEST_PROTOCOL-$QUERY_PROTOCOL-$QUERY_CACHE}"
+mkdir -p "$WORKDIR/results"
+RESULTS_DIR=$(mktemp -d "$WORKDIR/results/$RUN_PREFIX.XXXXXX")
+RUN_ID=$(basename "$RESULTS_DIR")
+RUN_OWNER_TOKEN="$RUN_ID-$$-$RANDOM-$RANDOM"
 
 if [ ! -d "$TSBS_DIR/.git" ]; then
   git clone https://github.com/questdb/tsbs.git "$TSBS_DIR"
@@ -120,7 +125,7 @@ remove_benchmark_container() {
     return 0
   fi
   owner=$(docker inspect --format '{{ index .Config.Labels "com.questdb.tsbs-benchmark.run" }}' "$CONTAINER_NAME")
-  if [ "$owner" != "$RUN_ID" ]; then
+  if [ "$owner" != "$RUN_OWNER_TOKEN" ]; then
     printf 'refusing to remove unowned container %s\n' "$CONTAINER_NAME" >&2
     return 1
   fi
@@ -130,7 +135,7 @@ remove_benchmark_container() {
 start_clean_questdb() {
   remove_benchmark_container
   docker run -d --name "$CONTAINER_NAME" \
-    --label "com.questdb.tsbs-benchmark.run=$RUN_ID" \
+    --label "com.questdb.tsbs-benchmark.run=$RUN_OWNER_TOKEN" \
     -p 127.0.0.1:9000:9000 \
     -p 127.0.0.1:9009:9009 \
     -p 127.0.0.1:8812:8812 \
