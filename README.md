@@ -29,7 +29,7 @@ Ingestion and query transport are selected independently:
 | Ingestion | ILP over TCP (`ilp`), ILP over HTTP (`ilp-http`), or QuestDB Wire Ingestion Protocol (`qwip`) |
 | Query latency | PostgreSQL wire (`pgwire`), REST (`http`), or QuestDB Wire Execution Protocol (`qwep`) |
 
-QWIP data uses TSBS's binary `questdb-qwp` generator format. ILP uses the text `questdb` format. Query streams use `questdb` for every query transport.
+QWIP data uses TSBS's binary `questdb-qwp` generator format. ILP uses the text `questdb` format. Query streams use `questdb` for every query transport. The skill follows a public moving TSBS integration branch with current QuestDB protocol support by default; override `TSBS_REF` as those changes move.
 
 ## Example defaults
 

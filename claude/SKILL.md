@@ -20,6 +20,7 @@ Use these practical defaults unless the operator requests different values:
 
 ```bash
 QUESTDB_IMAGE="${QUESTDB_IMAGE:-questdb/questdb:latest}"
+TSBS_REF="${TSBS_REF-feature/qwip-qwep-influxv3}" # set empty to use the repository default branch
 CONTAINER_NAME="${CONTAINER_NAME:-questdb-tsbs-benchmark}"
 INGEST_PROTOCOL="${INGEST_PROTOCOL:-ilp}"       # ilp | ilp-http | qwip
 QUERY_PROTOCOL="${QUERY_PROTOCOL:-pgwire}"     # pgwire | http | qwep
@@ -78,8 +79,15 @@ RUN_OWNER_TOKEN="$RUN_ID-$$-$RANDOM-$RANDOM"
 
 if [ ! -d "$TSBS_DIR/.git" ]; then
   git clone https://github.com/questdb/tsbs.git "$TSBS_DIR"
+fi
+
+git -C "$TSBS_DIR" fetch origin
+if [ -n "$TSBS_REF" ]; then
+  git -C "$TSBS_DIR" fetch origin "$TSBS_REF"
+  git -C "$TSBS_DIR" checkout --detach FETCH_HEAD
 else
-  git -C "$TSBS_DIR" pull --ff-only
+  default_ref=$(git -C "$TSBS_DIR" symbolic-ref --short refs/remotes/origin/HEAD)
+  git -C "$TSBS_DIR" checkout --detach "$default_ref"
 fi
 
 make -C "$TSBS_DIR" \
@@ -97,11 +105,11 @@ Before a large run, check that the selected protocols are supported:
 load_help=$("$TSBS_BIN/tsbs_load_questdb" --help 2>&1 || true)
 query_help=$("$TSBS_BIN/tsbs_run_queries_questdb" --help 2>&1 || true)
 grep -Fq "$INGEST_PROTOCOL" <<<"$load_help" || {
-  printf 'TSBS loader does not list protocol %s\n' "$INGEST_PROTOCOL" >&2
+  printf 'TSBS loader does not list protocol %s; choose a compatible TSBS_REF\n' "$INGEST_PROTOCOL" >&2
   exit 1
 }
 grep -Fq "$QUERY_PROTOCOL" <<<"$query_help" || {
-  printf 'TSBS query runner does not list protocol %s\n' "$QUERY_PROTOCOL" >&2
+  printf 'TSBS query runner does not list protocol %s; choose a compatible TSBS_REF\n' "$QUERY_PROTOCOL" >&2
   exit 1
 }
 ```
