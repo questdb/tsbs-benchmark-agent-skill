@@ -1,25 +1,56 @@
 # TSBS Benchmark Agent Skill
 
-AI coding agent skill that runs end-to-end [TSBS](https://github.com/questdb/tsbs) (Time Series Benchmark Suite) benchmarks against [QuestDB](https://questdb.io/) in Docker. Works with both [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenAI Codex](https://openai.com/index/introducing-codex/).
+AI coding agent skill for running end-to-end [TSBS](https://github.com/questdb/tsbs) ingestion and query-latency benchmarks against [QuestDB](https://questdb.io/) in Docker. It works with both [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenAI Codex](https://openai.com/index/introducing-codex/).
 
-Instead of manually running a dozen commands, just tell your agent to benchmark QuestDB and it handles everything - installing prerequisites, spinning up Docker, building TSBS, generating data, loading it, and running all 16 query types.
+Tell the agent to benchmark QuestDB and it handles the workflow: prerequisites, Docker setup, TSBS build, workload generation, ingestion, query preparation, repeated measurements, result summaries, and cleanup.
 
-## What the skill does
+## Methodology
 
-The skill walks the agent through the full TSBS pipeline:
+The skill follows the same broad TSBS workflow used for QuestDB benchmark runs:
 
-1. **Prerequisites** - Checks for and installs Docker, Go 1.22.5, and build tools
-2. **Start QuestDB** - Pulls and runs `questdb/questdb:latest` in Docker
-3. **Build TSBS** - Clones [questdb/tsbs](https://github.com/questdb/tsbs) and compiles the four required binaries
-4. **Generate data** - Produces ~12 GB of uncompressed `cpu-only` data (34.5M rows, 345.6M metrics)
-5. **Load data** - Ingests via ILP with auto-scaled worker count (up to 32)
-6. **Generate queries** - Creates 1,000 queries for each of the 16 `cpu-only` query types
-7. **Run benchmarks** - Executes all query types with a single worker (QuestDB parallelizes internally)
-8. **Cleanup** - Removes the Docker container and temporary files
+1. Choose ingestion and query protocols.
+2. Generate the `cpu-only` dataset and query streams once from explicit inputs.
+3. Measure ingestion repeatedly from an empty database.
+4. Prepare query latency on a fresh database and load the dataset once outside the timed query runs.
+5. Apply one cache policy for the full query run:
+   - `warm`: restart and reset the Linux page cache once, then run untimed round-robin warm-up passes before measurement;
+   - `cold`: restart and reset the Linux page cache before each timed query job.
+6. Run each query type with one query worker and collect multiple measured samples.
+7. Keep raw per-run output and summarize the samples.
+
+The Docker workflow stays intentionally approachable. Workload size, worker allocation, core pinning, protocols, cache policy, warm-up depth, and sample count can all be adjusted for the machine and benchmark goal.
+
+## Protocols
+
+Ingestion and query transport are selected independently:
+
+| Phase | Options |
+| --- | --- |
+| Ingestion | ILP over TCP (`ilp`), ILP over HTTP (`ilp-http`), or QuestDB Wire Ingestion Protocol (`qwip`) |
+| Query latency | PostgreSQL wire (`pgwire`), REST (`http`), or QuestDB Wire Execution Protocol (`qwep`) |
+
+QWIP data uses TSBS's binary `questdb-qwp` generator format. ILP uses the text `questdb` format. Query streams use `questdb` for every query transport.
+
+## Example defaults
+
+| Parameter | Value |
+| --- | --- |
+| Use case | `cpu-only` |
+| Scale | 4,000 hosts |
+| Time window | 2 days |
+| Log interval | 10 seconds |
+| Seed | 123 |
+| Query types | 16 |
+| Queries per type | 1,000 |
+| Measured samples | 3 |
+| Query workers | 1 |
+| Query cache | warm, with 3 untimed passes by default |
+
+The defaults are a starting point, not a required benchmark profile.
 
 ## Repository structure
 
-```
+```text
 claude/
   SKILL.md          # Skill definition for Claude Code
 codex/
@@ -35,45 +66,36 @@ codex/
 Copy the skill into your Claude Code skills directory:
 
 ```bash
-cp -r claude/SKILL.md ~/.claude/skills/tsbs-benchmark/SKILL.md
+mkdir -p ~/.claude/skills/tsbs-benchmark
+cp claude/SKILL.md ~/.claude/skills/tsbs-benchmark/SKILL.md
 ```
 
-Then in Claude Code, ask it to run the TSBS benchmark against QuestDB.
+Then ask Claude Code to run a QuestDB TSBS benchmark. Mention any protocol, workload, cache, or sample-count preferences; otherwise the skill uses its practical defaults.
 
 ### OpenAI Codex
 
-Use the Codex agent definition and skill together. The `codex/agents/openai.yaml` provides the agent interface, and `codex/SKILL.md` provides the benchmark instructions.
+Copy `codex/SKILL.md` into the Codex skills directory and use it with `codex/agents/openai.yaml`.
 
-## Benchmark details
+## Results
 
-| Parameter | Value |
-|---|---|
-| Use case | `cpu-only` |
-| Scale | 4,000 hosts |
-| Time window | 1 day (2016-01-01) |
-| Log interval | 10s |
-| Data size | ~12 GB uncompressed |
-| Rows | 34.5M |
-| Metrics | 345.6M |
-| Query types | 16 |
-| Queries per type | 1,000 |
+The skill retains raw logs and per-query JSON, then reports:
 
-**Query types benchmarked:** `cpu-max-all-1`, `cpu-max-all-8`, `cpu-max-all-32-24`, `single-groupby-1-1-1`, `single-groupby-1-1-12`, `single-groupby-1-8-1`, `single-groupby-5-1-1`, `single-groupby-5-1-12`, `single-groupby-5-8-1`, `double-groupby-1`, `double-groupby-5`, `double-groupby-all`, `high-cpu-1`, `high-cpu-all`, `lastpoint`, `groupby-orderby-limit`
+- workload inputs and selected benchmark policy;
+- ingestion rows/s and metrics/s for each measured sample;
+- per-query QPS and latency quantiles for each measured sample;
+- mean, minimum, maximum, and population standard deviation across successful samples;
+- failed or incomplete samples without silently excluding them.
 
-## Key design decisions
-
-- **No gzip** - Data files are kept uncompressed. Compression/decompression adds CPU overhead that skews results, especially on smaller machines.
-- **Single query worker** - QuestDB parallelizes queries internally with multi-threaded execution. Multiple client workers would over-subscribe CPU and produce misleading results.
-- **Auto-scaled load workers** - Data loading uses one worker per CPU core (capped at 32) since ILP ingestion benefits from client-side parallelism.
+Warm-up output is kept separate from measured results.
 
 ## Ports
 
 | Port | Protocol | Purpose |
-|---|---|---|
-| 9000 | HTTP | Web Console |
-| 9009 | TCP | ILP (line protocol) - used for data loading |
-| 8812 | TCP | PostgreSQL wire - used for queries |
-| 9003 | HTTP | Health/metrics |
+| --- | --- | --- |
+| 9000 | HTTP / WebSocket | Web Console, ILP over HTTP, QWIP, REST queries, and QWEP |
+| 9009 | TCP | ILP over TCP |
+| 8812 | TCP | PostgreSQL wire queries |
+| 9003 | HTTP | Health and metrics |
 
 ## License
 
