@@ -20,10 +20,10 @@ Use these practical defaults unless the operator requests different values:
 
 ```bash
 QUESTDB_IMAGE="${QUESTDB_IMAGE:-questdb/questdb:latest}"
-TSBS_REF="${TSBS_REF-feature/qwip-qwep-influxv3}" # set empty to use the repository default branch
+TSBS_REF="${TSBS_REF-master}"                   # questdb/tsbs default branch; override with a tag or commit
 CONTAINER_NAME="${CONTAINER_NAME:-questdb-tsbs-benchmark}"
-INGEST_PROTOCOL="${INGEST_PROTOCOL:-ilp}"       # ilp | ilp-http | qwip
-QUERY_PROTOCOL="${QUERY_PROTOCOL:-pgwire}"     # pgwire | http | qwep
+INGEST_PROTOCOL="${INGEST_PROTOCOL:-ilp}"       # ilp | ilp-http | qwp
+QUERY_PROTOCOL="${QUERY_PROTOCOL:-pgwire}"     # pgwire | http | qwp
 QUERY_CACHE="${QUERY_CACHE:-warm}"             # warm | cold
 RUNS="${RUNS:-3}"
 WARMUP_RUNS="${WARMUP_RUNS:-3}"
@@ -33,8 +33,8 @@ LOAD_WORKERS="${LOAD_WORKERS:-$(nproc)}"
 METRICS_PER_ROW="${METRICS_PER_ROW:-10}"
 PAGE_CACHE_RESET_COMMAND="${PAGE_CACHE_RESET_COMMAND:-}"
 if [ "$LOAD_WORKERS" -gt 32 ]; then LOAD_WORKERS=32; fi
-case "$INGEST_PROTOCOL" in ilp|ilp-http|qwip) ;; *) printf 'invalid ingestion protocol\n' >&2; exit 1 ;; esac
-case "$QUERY_PROTOCOL" in pgwire|http|qwep) ;; *) printf 'invalid query protocol\n' >&2; exit 1 ;; esac
+case "$INGEST_PROTOCOL" in ilp|ilp-http|qwp) ;; *) printf 'invalid ingestion protocol\n' >&2; exit 1 ;; esac
+case "$QUERY_PROTOCOL" in pgwire|http|qwp) ;; *) printf 'invalid query protocol\n' >&2; exit 1 ;; esac
 case "$QUERY_CACHE" in warm|cold) ;; *) printf 'invalid query cache policy\n' >&2; exit 1 ;; esac
 ```
 
@@ -44,12 +44,12 @@ Ingestion and query protocols are independent. Use the protocol names exposed by
 | --- | --- | --- |
 | Ingestion | `ilp` | line protocol over TCP, port 9009 |
 | Ingestion | `ilp-http` | line protocol over HTTP, port 9000 |
-| Ingestion | `qwip` | QuestDB Wire Ingestion Protocol, port 9000 |
+| Ingestion | `qwp` | QWP ingress, port 9000 |
 | Query | `pgwire` | PostgreSQL wire, port 8812 |
 | Query | `http` | REST, port 9000 |
-| Query | `qwep` | QuestDB Wire Execution Protocol, port 9000 |
+| Query | `qwp` | QWP egress, port 9000 |
 
-Choose protocols before generating data. `qwip` uses the `questdb-qwp` data format; the ILP transports use `questdb`. Query files always use `questdb` and can be reused across query protocols. `RUNS` is the sample count for ingestion and for each selected query type.
+Choose protocols before generating data. QWP ingress uses the `questdb-qwp` data format; the ILP transports use `questdb`. Query files always use `questdb` and can be reused across query protocols. `RUNS` is the sample count for ingestion and for each selected query type.
 
 ## 1. Check prerequisites
 
@@ -166,7 +166,7 @@ END="2016-01-03T00:00:00Z"
 INTERVAL="10s"
 SEED="123"
 
-if [ "$INGEST_PROTOCOL" = "qwip" ]; then
+if [ "$INGEST_PROTOCOL" = "qwp" ]; then
   DATA_FORMAT="questdb-qwp"
   DATA_FILE="$WORKDIR/questdb-data.qwp"
 else
